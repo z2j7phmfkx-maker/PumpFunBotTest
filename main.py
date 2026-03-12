@@ -1,0 +1,617 @@
+import requests, json, time, re, threading
+from datetime import datetime, timedelta
+
+# Configuration globale
+TELEGRAM_BOT_TOKEN = "8237470758:AAEzNur6CwqofKTYaKBdFToiJNbl8_sAhTI"
+CREATOR_ADDRESS = "6PAWNJCJqSmeHH6UKo83Gvqyh9sZH4ZmHNza7NsNAwBP"
+RPC_URL = "https://mainnet.helius-rpc.com/?api-key=4d11d3a1-149a-49fd-a112-94a008ede057"
+TRADE_AMOUNT = 3
+PROFIT_TARGET = 0.15
+PUMP_FUN_FEE = 0.01
+SOLANA_GAS_FEE_MIN = 0.00025
+SOLANA_GAS_FEE_MAX = 0.005
+
+# Stockage par utilisateur
+bot_running = False
+realtime_active = {}
+user_configs = {}
+user_wallets = {}
+user_history = {}
+update_offset = 0
+
+def load_user_data(user_id):
+    """Charge ou crée les données pour un utilisateur"""
+    if user_id not in user_configs:
+        user_configs[user_id] = {"trade_amount": TRADE_AMOUNT, "profit_target": PROFIT_TARGET}
+    if user_id not in user_wallets:
+        user_wallets[user_id] = []
+    if user_id not in user_history:
+        user_history[user_id] = []
+    
+    try:
+        with open(f"config_{user_id}.json", "r") as f:
+            user_configs[user_id] = json.load(f)
+    except:
+        pass
+    
+    try:
+        with open(f"wallets_{user_id}.json", "r") as f:
+            user_wallets[user_id] = json.load(f)
+    except:
+        pass
+    
+    try:
+        with open(f"history_{user_id}.json", "r") as f:
+            user_history[user_id] = json.load(f)
+    except:
+        pass
+
+def save_user_data(user_id):
+    """Sauvegarde les données d'un utilisateur"""
+    try:
+        with open(f"config_{user_id}.json", "w") as f:
+            json.dump(user_configs[user_id], f, indent=2)
+        with open(f"wallets_{user_id}.json", "w") as f:
+            json.dump(user_wallets[user_id], f, indent=2)
+        with open(f"history_{user_id}.json", "w") as f:
+            json.dump(user_history[user_id], f, indent=2)
+    except:
+        pass
+
+def send_telegram(user_id, msg):
+    """Envoie un message à UN UTILISATEUR SPÉCIFIQUE"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": user_id, "text": msg, "parse_mode": "HTML"}, timeout=10)
+        print(f"✅ Message envoyé à {user_id}")
+    except Exception as e:
+        print(f"❌ Erreur: {e}")
+
+def heartbeat():
+    """Envoie un signal toutes les 10 min pour éviter que Render coupe le bot"""
+    global bot_running
+    while bot_running:
+        try:
+            print(f"💓 Heartbeat - Bot actif - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            time.sleep(600)  # ← 10 minutes (600 sec)
+        except:
+            pass
+
+def get_updates():
+    global update_offset
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        response = requests.post(url, json={"offset": update_offset, "timeout": 30}, timeout=35)
+        data = response.json()
+        if data.get("ok"):
+            return data.get("result", [])
+    except:
+        pass
+    return []
+
+def extract_number(text):
+    """Extrait un nombre d'une chaîne"""
+    match = re.search(r'[\d.]+', text)
+    return float(match.group()) if match else None
+
+def get_sol_price():
+    """Récupère le prix réel de SOL en EUR"""
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=eur"
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            price = data.get("solana", {}).get("eur", 240)
+            print(f"✅ Prix SOL: {price}€")
+            return price
+    except Exception as e:
+        print(f"⚠️ Erreur récupération prix SOL: {e}")
+    return 240
+
+def get_token_prices(token_mint):
+    """Récupère les prix RÉELS du token"""
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{token_mint}/transactions"
+        params = {"api-key": "4d11d3a1-149a-49fd-a112-94a008ede057", "limit": 50}
+        r = requests.get(url, params=params, timeout=10)
+        
+        if r.status_code == 200:
+            txs = r.json()
+            prices = [tx.get("native_transfers", [{}])[0].get("amount", 0) for tx in txs if tx.get("native_transfers")]
+            
+            if prices:
+                entry = min(prices) / 1e9 if prices else 0.00001
+                ath = max(prices) / 1e9 if prices else 0.00013
+                return {
+                    "entry": entry,
+                    "ath": ath,
+                    "current": ath
+                }
+    except Exception as e:
+        print(f"⚠️ Erreur récupération prix token: {e}")
+    
+    return {
+        "entry": 0.00001,
+        "ath": 0.00013,
+        "current": 0.00013
+    }
+
+def calculate_target_sell_price(user_id, entry_price, sol_price):
+    """Calcule le prix de vente cible pour atteindre +15% net"""
+    config = user_configs[user_id]
+    trade_amt = config["trade_amount"]
+    profit_tgt = config["profit_target"]
+    
+    gas_fee_eur = (SOLANA_GAS_FEE_MIN + SOLANA_GAS_FEE_MAX) / 2
+    fee_buy = trade_amt * PUMP_FUN_FEE
+    net_buy = trade_amt - fee_buy - gas_fee_eur
+    
+    target_amount = trade_amt * (1 + profit_tgt)
+    amount_before_sell_fee = target_amount / (1 - PUMP_FUN_FEE)
+    target_sell_price = amount_before_sell_fee / (trade_amt / entry_price) if entry_price > 0 else 0
+    
+    return {
+        "entry": entry_price,
+        "target": target_sell_price,
+        "gain_needed": (target_sell_price - entry_price) / entry_price if entry_price > 0 else 0,
+        "net_invested": net_buy
+    }
+
+def simulate_trade(user_id, entry, actual_sell, ath, name, sol_price):
+    """Simule un trade avec frais RÉELS"""
+    config = user_configs[user_id]
+    trade_amt = config["trade_amount"]
+    profit_tgt = config["profit_target"]
+    
+    gas_fee_buy = (SOLANA_GAS_FEE_MIN + SOLANA_GAS_FEE_MAX) / 2
+    fee_buy = trade_amt * PUMP_FUN_FEE
+    net_invested = trade_amt - fee_buy - gas_fee_buy
+    
+    tokens_bought = trade_amt / entry if entry > 0 else 0
+    amount_at_sell = tokens_bought * actual_sell
+    
+    gas_fee_sell = (SOLANA_GAS_FEE_MIN + SOLANA_GAS_FEE_MAX) / 2
+    fee_sell = amount_at_sell * PUMP_FUN_FEE
+    net_received = amount_at_sell - fee_sell - gas_fee_sell
+    
+    profit_net = net_received - net_invested
+    profit_percent = (profit_net / net_invested * 100) if net_invested > 0 else 0
+    gross_gain = (actual_sell - entry) / entry if entry > 0 else 0
+    ath_percent = (ath - entry) / entry if entry > 0 else 0
+    
+    win = profit_percent >= (profit_tgt * 100)
+    
+    return {
+        "name": name,
+        "entry": entry,
+        "actual_sell": actual_sell,
+        "ath": ath,
+        "ath_percent": ath_percent,
+        "gross_gain": gross_gain,
+        "fee_buy": fee_buy,
+        "gas_buy": gas_fee_buy,
+        "net_invested": net_invested,
+        "tokens_bought": tokens_bought,
+        "fee_sell": fee_sell,
+        "gas_sell": gas_fee_sell,
+        "net_received": net_received,
+        "profit_net": profit_net,
+        "profit_percent": profit_percent,
+        "win": win
+    }
+
+def format_trade_detail(user_id, token, calc, target_info, sol_price):
+    config = user_configs[user_id]
+    name = token.get("name", "Unknown")
+    ca = token.get("ca", "CA non disponible")
+    url = token.get("url", "#")
+    status = "✅ WIN" if calc["win"] else "❌ LOSS"
+    
+    detail = f"{status} <b>{name}</b>\n\n"
+    detail += f"<b>📍 Contract Address</b>\n"
+    detail += f"<code>{ca}</code>\n\n"
+    
+    detail += f"<b>💹 Prix SOL</b>\n"
+    detail += f"{sol_price:.2f}€\n\n"
+    
+    detail += f"<b>📈 Token Info</b>\n"
+    detail += f"Prix entrée: {calc['entry']:.10f} SOL ({calc['entry']*sol_price:.6f}€)\n"
+    detail += f"ATH: +{calc['ath_percent']*100:.2f}% ({calc['ath']:.10f} SOL / {calc['ath']*sol_price:.6f}€)\n"
+    detail += f"Prix vente: {calc['actual_sell']:.10f} SOL\n\n"
+    
+    detail += f"<b>💰 Prix cible pour +{config['profit_target']*100:.0f}% net</b>\n"
+    detail += f"Entrée: {target_info['entry']:.10f} SOL\n"
+    detail += f"Cible: {target_info['target']:.10f} SOL\n"
+    detail += f"Gain brut requis: +{target_info['gain_needed']*100:.2f}%\n\n"
+    
+    detail += f"<b>🛒 Achat</b>\n"
+    detail += f"Mise: {config['trade_amount']}€\n"
+    detail += f"Frais Pump.fun (1%): {calc['fee_buy']:.4f}€\n"
+    detail += f"Gaz Solana: {calc['gas_buy']:.6f}€\n"
+    detail += f"Net investi: {calc['net_invested']:.4f}€\n\n"
+    
+    detail += f"<b>📤 Vente</b>\n"
+    detail += f"Montant reçu: {calc['net_received']:.4f}€\n"
+    detail += f"Frais Pump.fun (1%): {calc['fee_sell']:.4f}€\n"
+    detail += f"Gaz Solana: {calc['gas_sell']:.6f}€\n"
+    detail += f"Net reçu: {calc['net_received']:.4f}€\n\n"
+    
+    detail += f"<b>💵 Résultat</b>\n"
+    detail += f"Profit net: <b>{calc['profit_net']:.4f}€</b>\n"
+    detail += f"Rendement: <b>{calc['profit_percent']:.2f}%</b>\n\n"
+    detail += f"🔗 <a href='{url}'>Voir sur Pump.fun</a>"
+    
+    return detail
+
+def get_pump_fun_tokens(user_id):
+    """Récupère les VRAIS tokens du wallet avec VRAIS prix"""
+    wallets = user_wallets[user_id]
+    
+    if not wallets:
+        return []
+    
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{wallets[0]}/transactions"
+        params = {"api-key": "4d11d3a1-149a-49fd-a112-94a008ede057", "limit": 50}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            txs = r.json()
+            print(f"✅ {len(txs)} transactions trouvées")
+            
+            tokens = []
+            for i, tx in enumerate(txs[:5]):
+                description = tx.get("description", f"Token {i+1}")
+                
+                token_mint = None
+                if "source" in tx:
+                    token_mint = tx["source"].get("mint", None)
+                if not token_mint and "destination" in tx:
+                    token_mint = tx["destination"].get("mint", None)
+                if not token_mint:
+                    token_mint = tx.get("mint", None)
+                
+                token_name = description.split("(")[0].strip() if "(" in description else description
+                token_name = token_name if token_name else f"Token {i+1}"
+                
+                ca_display = token_mint if token_mint else "CA non disponible"
+                
+                prices = get_token_prices(token_mint) if token_mint else {"entry": 0.00001, "ath": 0.00013, "current": 0.00013}
+                
+                tokens.append({
+                    "name": token_name,
+                    "ca": ca_display,
+                    "entry": prices["entry"],
+                    "ath": prices["ath"],
+                    "current": prices["current"],
+                    "url": f"https://pump.fun/coin/{token_mint}" if token_mint else "https://pump.fun"
+                })
+            
+            return tokens
+    except Exception as e:
+        print(f"⚠️ Erreur API: {e}")
+    
+    return []
+
+def get_history_stats(user_id, days=None):
+    """Récupère les stats de l'utilisateur"""
+    history = user_history[user_id]
+    if not history:
+        return None
+    
+    if days:
+        cutoff = datetime.now() - timedelta(days=days)
+        trades = [t for t in history if datetime.fromisoformat(t.get("timestamp", datetime.now().isoformat())) >= cutoff]
+    else:
+        trades = history
+    
+    if not trades:
+        return None
+    
+    wins = sum(1 for t in trades if t.get("win"))
+    losses = len(trades) - wins
+    total_profit = sum(t.get("profit_net", 0) for t in trades)
+    avg_profit = total_profit / len(trades) if trades else 0
+    win_rate = (wins / len(trades) * 100) if trades else 0
+    
+    return {
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "total_profit": total_profit,
+        "avg_profit": avg_profit
+    }
+
+def handle_command(user_id, command):
+    """Traite les commandes Telegram"""
+    global realtime_active
+    
+    load_user_data(user_id)
+    config = user_configs[user_id]
+    
+    parts = command.split()
+    cmd = parts[0].lower()
+    
+    if cmd == "/start":
+        msg = "🤖 <b>Bot Pump.Fun activé!</b>\n\n"
+        msg += "<b>Commandes principales:</b>\n"
+        msg += "/backtest – Tester les tokens\n"
+        msg += "/realtime – Temps réel (max 5 tokens)\n"
+        msg += "/stop – Arrêter\n"
+        msg += "/stats – Stats globales\n"
+        msg += "/history_week – Stats 7j\n"
+        msg += "/history_month – Stats 30j\n\n"
+        msg += "<b>Configuration:</b>\n"
+        msg += "/config – Afficher config\n"
+        msg += "/set_amount 5 (ou 5€)\n"
+        msg += "/set_target 20 (ou 20%)\n\n"
+        msg += "<b>Wallets:</b>\n"
+        msg += "/add_wallet [addr]\n"
+        msg += "/remove_wallet [addr]\n"
+        msg += "/list_wallets\n"
+        msg += "/clear_wallets\n\n"
+        msg += f"<b>Wallets suivis:</b> {len(user_wallets[user_id])}\n"
+        msg += f"<b>Montant:</b> {config['trade_amount']}€\n"
+        msg += f"<b>Target:</b> +{config['profit_target']*100:.0f}%"
+        send_telegram(user_id, msg)
+    
+    elif cmd == "/backtest":
+        send_telegram(user_id, "📊 <b>Backtesting...</b>\n⏳ Récupération des données réelles…")
+        run_backtest(user_id)
+    
+    elif cmd == "/realtime":
+        if not realtime_active.get(user_id, False):
+            realtime_active[user_id] = True
+            send_telegram(user_id, "🚀 <b>Temps réel activé!</b>\n⏳ Attente de tokens…")
+            run_realtime_simulation(user_id)
+        else:
+            send_telegram(user_id, "⚠️ Temps réel déjà actif!")
+    
+    elif cmd == "/stop":
+        realtime_active[user_id] = False
+        send_telegram(user_id, "⏹️ Arrêté")
+    
+    elif cmd == "/stats":
+        stats = get_history_stats(user_id)
+        if stats:
+            msg = f"📈 <b>Statistiques globales</b>\n"
+            msg += f"Trades: {stats['trades']}\n"
+            msg += f"Gagnants: {stats['wins']} | Perdants: {stats['losses']}\n"
+            msg += f"Taux: {stats['win_rate']:.1f}%\n"
+            msg += f"Profit total: <b>{stats['total_profit']:.2f}€</b>\n"
+            msg += f"Profit moyen: {stats['avg_profit']:.2f}€"
+            send_telegram(user_id, msg)
+        else:
+            send_telegram(user_id, "❌ Pas d'historique")
+    
+    elif cmd == "/history_week":
+        stats = get_history_stats(user_id, days=7)
+        if stats:
+            msg = f"📊 <b>Stats 7 jours</b>\n"
+            msg += f"Trades: {stats['trades']}\n"
+            msg += f"Gagnants: {stats['wins']} | Perdants: {stats['losses']}\n"
+            msg += f"Taux: {stats['win_rate']:.1f}%\n"
+            msg += f"Profit total: <b>{stats['total_profit']:.2f}€</b>"
+            send_telegram(user_id, msg)
+        else:
+            send_telegram(user_id, "❌ Pas de données")
+    
+    elif cmd == "/history_month":
+        stats = get_history_stats(user_id, days=30)
+        if stats:
+            msg = f"📊 <b>Stats 30 jours</b>\n"
+            msg += f"Trades: {stats['trades']}\n"
+            msg += f"Gagnants: {stats['wins']} | Perdants: {stats['losses']}\n"
+            msg += f"Taux: {stats['win_rate']:.1f}%\n"
+            msg += f"Profit total: <b>{stats['total_profit']:.2f}€</b>"
+            send_telegram(user_id, msg)
+        else:
+            send_telegram(user_id, "❌ Pas de données")
+    
+    elif cmd == "/config":
+        sol_price = get_sol_price()
+        msg = "<b>⚙️ Configuration</b>\n\n"
+        msg += f"Montant: {config['trade_amount']}€\n"
+        msg += f"Target: +{config['profit_target']*100:.0f}%\n"
+        msg += f"Frais Pump: {PUMP_FUN_FEE*100:.1f}%\n"
+        msg += f"Gaz Solana (moyen): {((SOLANA_GAS_FEE_MIN + SOLANA_GAS_FEE_MAX) / 2):.6f}€\n"
+        msg += f"Prix SOL: {sol_price:.2f}€"
+        send_telegram(user_id, msg)
+    
+    elif cmd == "/set_amount":
+        if len(parts) > 1:
+            num = extract_number(' '.join(parts[1:]))
+            if num and num > 0:
+                user_configs[user_id]["trade_amount"] = float(num)
+                save_user_data(user_id)
+                send_telegram(user_id, f"✅ Montant: {user_configs[user_id]['trade_amount']}€")
+            else:
+                send_telegram(user_id, "❌ Format invalide")
+        else:
+            send_telegram(user_id, "❌ Utilise: /set_amount 5")
+    
+    elif cmd == "/set_target":
+        if len(parts) > 1:
+            num = extract_number(' '.join(parts[1:]))
+            if num and num > 0:
+                user_configs[user_id]["profit_target"] = float(num) / 100
+                save_user_data(user_id)
+                send_telegram(user_id, f"✅ Target: +{user_configs[user_id]['profit_target']*100:.0f}%")
+            else:
+                send_telegram(user_id, "❌ Format invalide")
+        else:
+            send_telegram(user_id, "❌ Utilise: /set_target 20")
+    
+    elif cmd == "/add_wallet":
+        if len(parts) > 1:
+            addr = parts[1]
+            if addr not in user_wallets[user_id]:
+                user_wallets[user_id].append(addr)
+                save_user_data(user_id)
+                send_telegram(user_id, f"✅ Wallet ajouté\n<code>{addr}</code>\nTotal: {len(user_wallets[user_id])}")
+            else:
+                send_telegram(user_id, "⚠️ Déjà suivi")
+        else:
+            send_telegram(user_id, "❌ Utilise: /add_wallet [addr]")
+    
+    elif cmd == "/remove_wallet":
+        if len(parts) > 1:
+            addr = parts[1]
+            if addr in user_wallets[user_id]:
+                user_wallets[user_id].remove(addr)
+                save_user_data(user_id)
+                send_telegram(user_id, f"✅ Wallet retiré\nTotal: {len(user_wallets[user_id])}")
+            else:
+                send_telegram(user_id, "⚠️ Non trouvé")
+        else:
+            send_telegram(user_id, "❌ Utilise: /remove_wallet [addr]")
+    
+    elif cmd == "/list_wallets":
+        if user_wallets[user_id]:
+            msg = "<b>📍 Wallets:</b>\n\n"
+            for i, w in enumerate(user_wallets[user_id], 1):
+                msg += f"{i}. <code>{w}</code>\n"
+            send_telegram(user_id, msg)
+        else:
+            send_telegram(user_id, "❌ Aucun wallet")
+    
+    elif cmd == "/clear_wallets":
+        user_wallets[user_id] = []
+        save_user_data(user_id)
+        send_telegram(user_id, "✅ Wallets supprimés")
+    
+    else:
+        send_telegram(user_id, "❌ Commande inconnue")
+
+def run_backtest(user_id):
+    """Lance le backtesting"""
+    if not user_wallets[user_id]:
+        send_telegram(user_id, "❌ Aucun wallet suivi.\n\nAjoute un wallet avec: /add_wallet [adresse]")
+        return
+    
+    sol_price = get_sol_price()
+    tokens = get_pump_fun_tokens(user_id)
+    
+    if not tokens:
+        send_telegram(user_id, "❌ Aucun token trouvé pour ce wallet.\n\nVérifie que le wallet a créé des tokens sur Pump.fun.")
+        return
+    
+    config = user_configs[user_id]
+    wins = losses = total_profit = 0
+    
+    for token in tokens:
+        entry = token["entry"]
+        ath = token["ath"]
+        
+        target_info = calculate_target_sell_price(user_id, entry, sol_price)
+        calc = simulate_trade(user_id, entry, ath, ath, token["name"], sol_price)
+        
+        detail = format_trade_detail(user_id, token, calc, target_info, sol_price)
+        send_telegram(user_id, detail)
+        
+        if calc["win"]:
+            wins += 1
+        else:
+            losses += 1
+        
+        total_profit += calc["profit_net"]
+        
+        user_history[user_id].append({
+            "timestamp": datetime.now().isoformat(),
+            "name": token["name"],
+            "ca": token["ca"],
+            "entry": entry,
+            "ath": ath,
+            "profit_net": calc["profit_net"],
+            "profit_percent": calc["profit_percent"],
+            "win": calc["win"]
+        })
+        save_user_data(user_id)
+        time.sleep(1)
+    
+    total = len(tokens)
+    win_rate = (wins / total * 100) if total else 0
+    
+    summary = f"---\n📈 <b>RÉSUMÉ</b>\n"
+    summary += f"Tokens: {total} | Gagnants: {wins} | Perdants: {losses}\n"
+    summary += f"Taux: {win_rate:.1f}%\n"
+    summary += f"<b>Profit total: {total_profit:.2f}€</b>"
+    send_telegram(user_id, summary)
+
+def run_realtime_simulation(user_id):
+    """Lance la simulation temps réel"""
+    global realtime_active
+    
+    if not user_wallets[user_id]:
+        send_telegram(user_id, "❌ Aucun wallet suivi.")
+        realtime_active[user_id] = False
+        return
+    
+    sol_price = get_sol_price()
+    tokens = get_pump_fun_tokens(user_id)
+    
+    if not tokens:
+        send_telegram(user_id, "❌ Aucun token trouvé pour ce wallet.")
+        realtime_active[user_id] = False
+        return
+    
+    for token in tokens:
+        if not realtime_active.get(user_id, False):
+            break
+        
+        entry = token["entry"]
+        ath = token["ath"]
+        
+        target_info = calculate_target_sell_price(user_id, entry, sol_price)
+        calc = simulate_trade(user_id, entry, ath, ath, token["name"], sol_price)
+        
+        detail = format_trade_detail(user_id, token, calc, target_info, sol_price)
+        send_telegram(user_id, detail)
+        
+        user_history[user_id].append({
+            "timestamp": datetime.now().isoformat(),
+            "name": token["name"],
+            "ca": token["ca"],
+            "entry": entry,
+            "ath": ath,
+            "profit_net": calc["profit_net"],
+            "profit_percent": calc["profit_percent"],
+            "win": calc["win"]
+        })
+        save_user_data(user_id)
+        time.sleep(5)
+    
+    realtime_active[user_id] = False
+    send_telegram(user_id, "✅ Temps réel terminé")
+
+def run():
+    """Boucle principale du bot"""
+    global bot_running, update_offset
+    bot_running = True
+    
+    print("🤖 Bot multi-utilisateur activé…")
+    
+    # Lance le heartbeat dans un thread séparé
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    
+    while bot_running:
+        try:
+            updates = get_updates()
+            for upd in updates:
+                update_offset = upd.get("update_id") + 1
+                msg = upd.get("message", {})
+                text = msg.get("text", "")
+                user_id = msg.get("chat", {}).get("id")
+                
+                if user_id and text.startswith("/"):
+                    print(f"📨 {user_id}: {text}")
+                    handle_command(user_id, text)
+            
+            time.sleep(1)
+        except Exception as e:
+            print(f"❌ Erreur: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    run()
